@@ -1,0 +1,40 @@
+`timescale 1ns / 1ps
+//////////////////////////////////////////////////////////////////////////////////
+// Company: 
+// Engineer: 
+// 
+// Create Date: 02.02.2026 21:42:07
+// Design Name: 
+// Module Name: SDR_top_level
+// Project Name: 
+// Target Devices: 
+// Tool Versions: 
+// Description: 
+// 
+// Dependencies: 
+// 
+// Revision:
+// Revision 0.01 - File Created
+// Additional Comments:
+// 
+//////////////////////////////////////////////////////////////////////////////////
+
+
+module SDR_top_level(
+    input logic clk,
+    input logic reset,
+    output logic [1:0] cycle
+    );
+    
+    wave #(
+        .WIDTH(32),
+        .CLK_FREQ(100_000_000),
+        .SIGNAL (660_000)
+    )  WAVE  (
+        .clk(clk),
+        .reset(reset),
+        .cycle(cycle)
+        
+    );
+    
+endmodule

@@ -1,0 +1,49 @@
+# =========================
+# Python virtual environments
+# =========================
+venv/
+.env/
+
+# =========================
+# Python cache / bytecode
+# =========================
+__pycache__/
+*.py[cod]
+
+# =========================
+# Build / simulation outputs
+# =========================
+build/
+dist/
+*.egg-info/
+
+# =========================
+# Logs & temp files
+# =========================
+*.log
+*.tmp
+
+# =========================
+# OS-generated files
+# =========================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# =========================
+# Editor / IDE files
+# =========================
+.vscode/
+.idea/
+
+# =========================
+# Jupyter (if you use it)
+# =========================
+.ipynb_checkpoints/
+
+# =========================
+# Optional: large binaries
+# =========================
+*.raw
+*.bin
+*.dat

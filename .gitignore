@@ -42,8 +42,14 @@ desktop.ini
 .ipynb_checkpoints/
 
 # =========================
-# Optional: large binaries
+# large binaries
 # =========================
 *.raw
 *.bin
 *.dat
+
+# =========================
+# LTSpice extra files
+# =========================
+*.autosave
+*.net

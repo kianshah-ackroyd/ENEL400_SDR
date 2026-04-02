@@ -1,0 +1,99 @@
+`timescale 1ns / 1ps
+module wave #(
+    parameter int WIDTH    = 32,
+    parameter int CLK_FREQ = 100_000_000
+)(
+    input  logic        clk,
+    input  logic        reset,
+    input  logic        enc_a,
+    input  logic        enc_b,
+    output logic [1:0]  cycle,
+    output logic [31:0] signal_out
+);
+    localparam int NUM_CHANNELS = 6;
+    localparam logic [31:0] FREQS [0:NUM_CHANNELS-1] = '{
+        32'd660_000,
+        32'd700_000,
+        32'd770_000,
+        32'd960_000,
+        32'd1_010_000,
+        32'd1_140_000
+    };
+    localparam logic [31:0] INCS [0:NUM_CHANNELS-1] = '{
+        32'd28346784,
+        32'd30064771,
+        32'd33071248,
+        32'd41231686,
+        32'd43379170,
+        32'd48962627
+    };
+
+    // Quadrature decoder
+    logic a_s0, a_s1, a_prev;
+    logic b_s0, b_s1, b_prev;
+    logic cw, ccw;
+
+    always_ff @(posedge clk) begin
+        a_s0 <= enc_a; a_s1 <= a_s0; a_prev <= a_s1;
+        b_s0 <= enc_b; b_s1 <= b_s0; b_prev <= b_s1;
+    end
+
+    logic [3:0] quad_state;
+    assign quad_state = {a_prev, b_prev, a_s1, b_s1};
+
+    always_ff @(posedge clk) begin
+        cw  <= 0;
+        ccw <= 0;
+        if (reset) begin
+            cw  <= 0;
+            ccw <= 0;
+        end else begin
+            case (quad_state)
+                4'b1100, 4'b0010, 4'b1011: cw  <= 1;
+                4'b1110, 4'b1000, 4'b0011: ccw <= 1;
+                default: ;
+            endcase
+        end
+    end
+
+    // Channel index
+    logic [2:0] ch_index;
+    always_ff @(posedge clk) begin
+        if (reset)
+            ch_index <= 3'd0;
+        else if (cw) begin
+            if (ch_index == NUM_CHANNELS - 1)
+                ch_index <= 3'd0;
+            else
+                ch_index <= ch_index + 3'd1;
+        end else if (ccw) begin
+            if (ch_index == 3'd0)
+                ch_index <= NUM_CHANNELS - 1;
+            else
+                ch_index <= ch_index - 3'd1;
+        end
+    end
+
+    assign signal_out = FREQS[ch_index];
+
+    // NCO
+    logic [WIDTH-1:0] adder_reg;
+    logic [WIDTH-1:0] square;
+
+    always_ff @(posedge clk) begin
+        if (reset)
+            adder_reg <= INCS[0];
+        else
+            adder_reg <= INCS[ch_index];
+    end
+
+    always_ff @(posedge clk) begin
+        if (reset)
+            square <= 32'd0;
+        else
+            square <= square + adder_reg;
+    end
+
+    assign cycle = square[WIDTH-1:WIDTH-2];
+
+endmodule

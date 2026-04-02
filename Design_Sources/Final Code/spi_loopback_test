@@ -1,0 +1,152 @@
+// Module: spi_loopback_test
+// Description: Self-test for spi_master - ties MOSI directly back to MISO.
+//              Whatever byte you send should come back on o_RX_Byte.
+//              Uses the Basys3 LEDs to show pass/fail.
+//
+// Test sequence:
+//   Sends 0xA5 then 0x3C then 0xFF in a loop.
+//   If RX byte matches TX byte -> LEDs show the received value.
+//   If mismatch -> LEDs show 8'hFF (all on) as error indicator.
+//
+// How to use:
+//   1. Synthesize this as your top module
+//   2. Physically wire a jumper from JA MOSI pin -> JA MISO pin on the Pmod
+//   3. Program the Basys3
+//   4. LEDs should cycle through 10100101 -> 00111100 -> 11111111 patterns
+//   5. If LEDs show all-on solid, there is a byte mismatch - check timing
+
+// Module: spi_loopback_test
+// Description: Self-test for spi_master - ties MOSI directly back to MISO.
+//              Whatever byte you send should come back on o_RX_Byte.
+//              Uses the Basys3 LEDs to show pass/fail.
+//
+// Test sequence:
+//   Sends 0xA5 then 0x3C then 0xFF in a loop.
+//   If RX byte matches TX byte -> LEDs show the received value.
+//   If mismatch -> LEDs show 8'hFF (all on) as error indicator.
+//
+// How to use:
+//   1. Synthesize this as your top module
+//   2. Physically wire a jumper from JA MOSI pin -> JA MISO pin on the Pmod
+//   3. Program the Basys3
+//   4. LEDs should cycle through 10100101 -> 00111100 -> 11111111 patterns
+//   5. If LEDs show all-on solid, there is a byte mismatch - check timing
+
+module spi_loopback_test (
+    input  logic        clk,
+    input  logic        reset,
+    output logic [7:0]  led,
+
+    // SPI pins (wire MOSI -> MISO externally with a jumper)
+    output logic        spi_sck,
+    output logic        spi_mosi,
+    output logic        spi_cs_n,  // not used by spi_master but good to drive
+    input  logic        spi_miso   // jumpered to spi_mosi on the Pmod header
+);
+
+    // -------------------------------------------------------------------------
+    // spi_master instance
+    // -------------------------------------------------------------------------
+    logic       tx_dv;
+    logic [7:0] tx_byte;
+    logic       tx_ready;
+    logic       rx_dv;
+    logic [7:0] rx_byte;
+
+    SPI_master #(
+        .SPI_MODE         (0),
+        .CLKS_PER_HALF_BIT(2)   // 100MHz / 4 = 25MHz SPI
+    ) u_spi (
+        .i_Rst_L   (~reset),
+        .i_Clk     (clk),
+        .i_TX_Byte (tx_byte),
+        .i_TX_DV   (tx_dv),
+        .o_TX_Ready(tx_ready),
+        .o_RX_DV   (rx_dv),
+        .o_RX_Byte (rx_byte),
+        .o_SPI_Clk (spi_sck),
+        .i_SPI_MISO(spi_miso),
+        .o_SPI_MOSI(spi_mosi)
+    );
+
+    // -------------------------------------------------------------------------
+    // Test sequencer
+    // -------------------------------------------------------------------------
+    // Test bytes to send in order
+    logic [7:0] test_bytes [0:2];
+    initial begin
+        test_bytes[0] = 8'hA5;  // 10100101
+        test_bytes[1] = 8'h3C;  // 00111100
+        test_bytes[2] = 8'hFF;  // 11111111
+    end
+
+    typedef enum logic [1:0] {
+        ST_SEND,
+        ST_WAIT_DONE,
+        ST_CHECK,
+        ST_PAUSE
+    } state_t;
+
+    state_t     state;
+    logic [1:0] byte_idx;
+    logic [7:0] tx_latch;
+    logic [23:0] pause_cnt;  // ~160ms pause between bytes at 100MHz
+
+    assign spi_cs_n = 1'b0;  // hold CS low for all transfers in loopback test
+
+    always_ff @(posedge clk) begin
+        if (reset) begin
+            state     <= ST_SEND;
+            byte_idx  <= '0;
+            tx_dv     <= 1'b0;
+            tx_byte   <= 8'h00;
+            tx_latch  <= 8'h00;
+            pause_cnt <= '0;
+            led       <= 8'b00000001; // show we're alive
+        end else begin
+            tx_dv <= 1'b0;
+
+            case (state)
+                ST_SEND: begin
+                    if (tx_ready) begin
+                        tx_byte  <= test_bytes[byte_idx];
+                        tx_latch <= test_bytes[byte_idx];
+                        tx_dv    <= 1'b1;
+                        state    <= ST_WAIT_DONE;
+                    end
+                end
+
+                ST_WAIT_DONE: begin
+                    // rx_dv fires when a full byte has been received
+                    if (rx_dv) begin
+                        state <= ST_CHECK;
+                    end
+                end
+
+                ST_CHECK: begin
+                    if (rx_byte == tx_latch) begin
+                        // Pass: show the received byte on LEDs
+                        led <= rx_byte;
+                    end else begin
+                        // Fail: all LEDs on solid
+                        led <= 8'hFF;
+                    end
+                    pause_cnt <= 24'd100_000_000; // ~1 second
+                    state     <= ST_PAUSE;
+                end
+
+                ST_PAUSE: begin
+                    if (pause_cnt == 0) begin
+                        // Move to next test byte
+                        byte_idx <= byte_idx + 1;
+                        if (byte_idx == 2)
+                            byte_idx <= '0;
+                        state <= ST_SEND;
+                    end else
+                        pause_cnt <= pause_cnt - 1;
+                end
+            endcase
+        end
+    end
+
+endmodule

@@ -1,0 +1,370 @@
+module ili9341_controller #(
+    parameter int CLK_FREQ = 100_000_000,
+    parameter int SPI_FREQ = 25_000_000,
+    parameter int RST_US   = 20,
+    parameter int WAIT_MS  = 150
+)(
+    input  logic        clk,
+    input  logic        reset,
+    output logic        spi_sck,
+    output logic        spi_mosi,
+    output logic        spi_cs_n,
+    output logic        spi_dc,
+    output logic        spi_rst_n,
+    output logic        lcd_backlight,
+    // Pixel interface
+    input  logic        draw_valid_i,
+    input  logic [4:0]  pixel_r_i,
+    input  logic [5:0]  pixel_g_i,
+    input  logic [4:0]  pixel_b_i,
+    output logic        draw_ready_o,
+    output logic        ready_o,
+    output logic        busy_o,
+    // Window set interface (tie off if unused)
+    input  logic        win_valid_i,
+    input  logic [9:0]  win_x0_i,
+    input  logic [9:0]  win_x1_i,
+    input  logic [9:0]  win_y0_i,
+    input  logic [9:0]  win_y1_i,
+    output logic        win_ready_o
+);
+
+    localparam int CLKS_PER_HALF_BIT = CLK_FREQ / (SPI_FREQ * 2);
+    localparam int RST_TICKS         = CLK_FREQ / 1_000_000 * RST_US;
+    localparam int WAIT_TICKS        = CLK_FREQ / 1_000     * WAIT_MS;
+    localparam int LAST_IDX          = 64;  // RAMWR entry
+
+    logic        spi_tx_dv;
+    logic [7:0]  spi_tx_byte;
+    logic        spi_tx_ready;
+
+    logic [6:0]  seq_idx;
+    logic [9:0]  rom_out;
+    logic [9:0]  seq_entry;
+    logic        latch_cs_high;
+
+    logic [31:0] delay_cnt;
+    logic [1:0]  px_byte;
+    logic [4:0]  px_r;
+    logic [5:0]  px_g;
+    logic [4:0]  px_b;
+
+    logic [3:0]  win_idx;
+    logic [9:0]  win_x0, win_x1, win_y0, win_y1;
+    logic [8:0]  win_byte;
+    logic        in_win;
+
+    typedef enum logic [3:0] {
+        ST_RESET      = 4'd0,
+        ST_RESET_WAIT = 4'd1,
+        ST_PRE_WAIT   = 4'd2,
+        ST_FETCH      = 4'd3,
+        ST_LATCH      = 4'd4,
+        ST_SEND       = 4'd5,
+        ST_WAIT0      = 4'd6,
+        ST_WAIT1      = 4'd7,
+        ST_CS_HIGH    = 4'd8,
+        ST_SLEEP_WAIT = 4'd9,
+        ST_READY      = 4'd10,
+        ST_PX_SEND    = 4'd11,
+        ST_PX_WAIT0   = 4'd12,
+        ST_PX_WAIT1   = 4'd13
+    } state_t;
+
+    state_t state;
+
+    SPI_master #(
+        .SPI_MODE         (0),
+        .CLKS_PER_HALF_BIT(CLKS_PER_HALF_BIT)
+    ) u_spi (
+        .i_Rst_L   (~reset),
+        .i_Clk     (clk),
+        .i_TX_Byte (spi_tx_byte),
+        .i_TX_DV   (spi_tx_dv),
+        .o_TX_Ready(spi_tx_ready),
+        .o_RX_DV   (),
+        .o_RX_Byte (),
+        .o_SPI_Clk (spi_sck),
+        .i_SPI_MISO(1'b0),
+        .o_SPI_MOSI(spi_mosi)
+    );
+
+    // ILI9341 init sequence ROM
+    // Bit 9: last (CS high after), Bit 8: dc (1=data, 0=cmd), Bits 7:0: byte
+    always_comb begin
+        case (seq_idx)
+            7'd0:  rom_out = {1'b1, 1'b0, 8'h01}; // SW Reset
+            7'd1:  rom_out = {1'b1, 1'b0, 8'h11}; // Sleep Out
+            7'd2:  rom_out = {1'b0, 1'b0, 8'h3A}; // COLMOD
+            7'd3:  rom_out = {1'b1, 1'b1, 8'h55}; // RGB565
+            7'd4:  rom_out = {1'b0, 1'b0, 8'h36}; // MADCTL
+            7'd5:  rom_out = {1'b1, 1'b1, 8'h28}; // Landscape, BGR
+            7'd6:  rom_out = {1'b0, 1'b0, 8'hB6}; // Display Function Control
+            7'd7:  rom_out = {1'b0, 1'b1, 8'h08};
+            7'd8:  rom_out = {1'b1, 1'b1, 8'h82};
+            7'd9:  rom_out = {1'b0, 1'b0, 8'hC0}; // Power Control 1
+            7'd10: rom_out = {1'b1, 1'b1, 8'h23};
+            7'd11: rom_out = {1'b0, 1'b0, 8'hC1}; // Power Control 2
+            7'd12: rom_out = {1'b1, 1'b1, 8'h10};
+            7'd13: rom_out = {1'b0, 1'b0, 8'hC5}; // VCOM Control 1
+            7'd14: rom_out = {1'b0, 1'b1, 8'h3E};
+            7'd15: rom_out = {1'b1, 1'b1, 8'h28};
+            7'd16: rom_out = {1'b0, 1'b0, 8'hC7}; // VCOM Control 2
+            7'd17: rom_out = {1'b1, 1'b1, 8'h86};
+            7'd18: rom_out = {1'b0, 1'b0, 8'hB1}; // Frame Rate Control
+            7'd19: rom_out = {1'b0, 1'b1, 8'h00};
+            7'd20: rom_out = {1'b1, 1'b1, 8'h18};
+            7'd21: rom_out = {1'b0, 1'b0, 8'hE0}; // Positive Gamma
+            7'd22: rom_out = {1'b0, 1'b1, 8'h0F};
+            7'd23: rom_out = {1'b0, 1'b1, 8'h31};
+            7'd24: rom_out = {1'b0, 1'b1, 8'h2B};
+            7'd25: rom_out = {1'b0, 1'b1, 8'h0C};
+            7'd26: rom_out = {1'b0, 1'b1, 8'h0E};
+            7'd27: rom_out = {1'b0, 1'b1, 8'h08};
+            7'd28: rom_out = {1'b0, 1'b1, 8'h4E};
+            7'd29: rom_out = {1'b0, 1'b1, 8'hF1};
+            7'd30: rom_out = {1'b0, 1'b1, 8'h37};
+            7'd31: rom_out = {1'b0, 1'b1, 8'h07};
+            7'd32: rom_out = {1'b0, 1'b1, 8'h10};
+            7'd33: rom_out = {1'b0, 1'b1, 8'h03};
+            7'd34: rom_out = {1'b0, 1'b1, 8'h0E};
+            7'd35: rom_out = {1'b0, 1'b1, 8'h09};
+            7'd36: rom_out = {1'b1, 1'b1, 8'h00};
+            7'd37: rom_out = {1'b0, 1'b0, 8'hE1}; // Negative Gamma
+            7'd38: rom_out = {1'b0, 1'b1, 8'h00};
+            7'd39: rom_out = {1'b0, 1'b1, 8'h0E};
+            7'd40: rom_out = {1'b0, 1'b1, 8'h14};
+            7'd41: rom_out = {1'b0, 1'b1, 8'h03};
+            7'd42: rom_out = {1'b0, 1'b1, 8'h11};
+            7'd43: rom_out = {1'b0, 1'b1, 8'h07};
+            7'd44: rom_out = {1'b0, 1'b1, 8'h31};
+            7'd45: rom_out = {1'b0, 1'b1, 8'hC1};
+            7'd46: rom_out = {1'b0, 1'b1, 8'h48};
+            7'd47: rom_out = {1'b0, 1'b1, 8'h08};
+            7'd48: rom_out = {1'b0, 1'b1, 8'h0F};
+            7'd49: rom_out = {1'b0, 1'b1, 8'h0C};
+            7'd50: rom_out = {1'b0, 1'b1, 8'h31};
+            7'd51: rom_out = {1'b0, 1'b1, 8'h36};
+            7'd52: rom_out = {1'b1, 1'b1, 8'h0F};
+            7'd53: rom_out = {1'b1, 1'b0, 8'h29}; // Display ON
+            7'd54: rom_out = {1'b0, 1'b0, 8'h2A}; // CASET
+            7'd55: rom_out = {1'b0, 1'b1, 8'h00};
+            7'd56: rom_out = {1'b0, 1'b1, 8'h00};
+            7'd57: rom_out = {1'b0, 1'b1, 8'h01};
+            7'd58: rom_out = {1'b1, 1'b1, 8'h3F}; // 319
+            7'd59: rom_out = {1'b0, 1'b0, 8'h2B}; // PASET
+            7'd60: rom_out = {1'b0, 1'b1, 8'h00};
+            7'd61: rom_out = {1'b0, 1'b1, 8'h00};
+            7'd62: rom_out = {1'b0, 1'b1, 8'h00};
+            7'd63: rom_out = {1'b1, 1'b1, 8'hEF}; // 239
+            7'd64: rom_out = {1'b1, 1'b0, 8'h2C}; // RAMWR
+            default: rom_out = {1'b1, 1'b0, 8'h00};
+        endcase
+    end
+
+    always_ff @(posedge clk or posedge reset) begin
+        if (reset) seq_entry <= '0;
+        else        seq_entry <= rom_out;
+    end
+
+    always_comb begin
+        case (win_idx)
+            4'd0:  win_byte = {1'b0, 8'h2A};
+            4'd1:  win_byte = {1'b1, 6'b0, win_x0[9:8]};
+            4'd2:  win_byte = {1'b1, win_x0[7:0]};
+            4'd3:  win_byte = {1'b1, 6'b0, win_x1[9:8]};
+            4'd4:  win_byte = {1'b1, win_x1[7:0]};
+            4'd5:  win_byte = {1'b0, 8'h2B};
+            4'd6:  win_byte = {1'b1, 6'b0, win_y0[9:8]};
+            4'd7:  win_byte = {1'b1, win_y0[7:0]};
+            4'd8:  win_byte = {1'b1, 6'b0, win_y1[9:8]};
+            4'd9:  win_byte = {1'b1, win_y1[7:0]};
+            4'd10: win_byte = {1'b0, 8'h2C};
+            default: win_byte = 9'h000;
+        endcase
+    end
+
+    always_ff @(posedge clk or posedge reset) begin
+        if (reset) begin
+            state         <= ST_RESET;
+            delay_cnt     <= '0;
+            seq_idx       <= '0;
+            px_byte       <= 2'd0;
+            latch_cs_high <= 1'b0;
+            spi_tx_dv     <= 1'b0;
+            spi_tx_byte   <= 8'h00;
+            spi_dc        <= 1'b0;
+            spi_cs_n      <= 1'b1;
+            spi_rst_n     <= 1'b0;
+            lcd_backlight <= 1'b0;
+            ready_o       <= 1'b0;
+            busy_o        <= 1'b1;
+            draw_ready_o  <= 1'b0;
+            win_ready_o   <= 1'b0;
+            win_idx       <= '0;
+            win_x0 <= '0; win_x1 <= '0;
+            win_y0 <= '0; win_y1 <= '0;
+            in_win        <= 1'b0;
+        end else begin
+            spi_tx_dv    <= 1'b0;
+            draw_ready_o <= 1'b0;
+            win_ready_o  <= 1'b0;
+
+            case (state)
+
+                ST_RESET: begin
+                    spi_rst_n <= 1'b0;
+                    spi_cs_n  <= 1'b1;
+                    spi_dc    <= 1'b0;
+                    delay_cnt <= RST_TICKS;
+                    state     <= ST_RESET_WAIT;
+                end
+
+                ST_RESET_WAIT: begin
+                    if (delay_cnt == 0) begin
+                        spi_rst_n <= 1'b1;
+                        delay_cnt <= WAIT_TICKS;
+                        state     <= ST_PRE_WAIT;
+                    end else delay_cnt <= delay_cnt - 1;
+                end
+
+                ST_PRE_WAIT: begin
+                    if (delay_cnt == 0) begin
+                        seq_idx <= '0;
+                        state   <= ST_FETCH;
+                    end else delay_cnt <= delay_cnt - 1;
+                end
+
+                ST_FETCH: state <= ST_LATCH;
+
+                ST_LATCH: begin
+                    spi_dc        <= seq_entry[8];
+                    spi_tx_byte   <= seq_entry[7:0];
+                    latch_cs_high <= seq_entry[9];
+                    state         <= ST_SEND;
+                end
+
+                ST_SEND: begin
+                    if (spi_tx_ready) begin
+                        spi_cs_n  <= 1'b0;
+                        spi_tx_dv <= 1'b1;
+                        state     <= ST_WAIT0;
+                    end
+                end
+
+                ST_WAIT0: begin
+                    if (!spi_tx_ready) state <= ST_WAIT1;
+                end
+
+                ST_WAIT1: begin
+                    if (spi_tx_ready) begin
+                        if (seq_idx == LAST_IDX) begin
+                            lcd_backlight <= 1'b1;
+                            busy_o        <= 1'b0;
+                            ready_o       <= 1'b1;
+                            spi_cs_n      <= 1'b1;
+                            state         <= ST_READY;
+                        end else if (latch_cs_high) begin
+                            seq_idx <= seq_idx + 1;
+                            state   <= ST_CS_HIGH;
+                        end else begin
+                            seq_idx <= seq_idx + 1;
+                            state   <= ST_FETCH;
+                        end
+                    end
+                end
+
+                ST_CS_HIGH: begin
+                    spi_cs_n <= 1'b1;
+                    if (seq_idx == 2) begin
+                        delay_cnt <= WAIT_TICKS;
+                        state     <= ST_SLEEP_WAIT;
+                    end else
+                        state <= ST_FETCH;
+                end
+
+                ST_SLEEP_WAIT: begin
+                    if (delay_cnt == 0) state <= ST_FETCH;
+                    else delay_cnt <= delay_cnt - 1;
+                end
+
+                ST_READY: begin
+                    spi_cs_n <= 1'b0;
+                    spi_dc   <= 1'b1;
+                    if (win_valid_i && spi_tx_ready) begin
+                        win_x0  <= win_x0_i;
+                        win_x1  <= win_x1_i;
+                        win_y0  <= win_y0_i;
+                        win_y1  <= win_y1_i;
+                        win_idx <= 4'd0;
+                        in_win  <= 1'b1;
+                        busy_o  <= 1'b1;
+                        state   <= ST_PX_SEND;
+                    end else if (draw_valid_i && spi_tx_ready) begin
+                        px_r         <= pixel_r_i;
+                        px_g         <= pixel_g_i;
+                        px_b         <= pixel_b_i;
+                        px_byte      <= 2'd0;
+                        in_win       <= 1'b0;
+                        draw_ready_o <= 1'b1;
+                        busy_o       <= 1'b1;
+                        state        <= ST_PX_SEND;
+                    end
+                end
+
+                ST_PX_SEND: begin
+                    if (spi_tx_ready) begin
+                        if (in_win) begin
+                            spi_dc      <= win_byte[8];
+                            spi_tx_byte <= win_byte[7:0];
+                        end else begin
+                            // RGB565: 2 bytes per pixel
+                            // Byte 0: RRRRRGGG (high byte)
+                            // Byte 1: GGGBBBBB (low byte)
+                            case (px_byte)
+                                2'd0: spi_tx_byte <= {px_r, px_g[5:3]};
+                                2'd1: spi_tx_byte <= {px_g[2:0], px_b};
+                                default: spi_tx_byte <= 8'h00;
+                            endcase
+                            spi_dc <= 1'b1;
+                        end
+                        spi_tx_dv <= 1'b1;
+                        state     <= ST_PX_WAIT0;
+                    end
+                end
+
+                ST_PX_WAIT0: begin
+                    if (!spi_tx_ready) state <= ST_PX_WAIT1;
+                end
+
+                ST_PX_WAIT1: begin
+                    if (spi_tx_ready) begin
+                        if (in_win) begin
+                            if (win_idx == 4'd10) begin
+                                win_ready_o <= 1'b1;
+                                busy_o      <= 1'b0;
+                                in_win      <= 1'b0;
+                                spi_dc      <= 1'b1;
+                                state       <= ST_READY;
+                            end else begin
+                                win_idx <= win_idx + 1;
+                                state   <= ST_PX_SEND;
+                            end
+                        end else begin
+                            // RGB565 is 2 bytes only
+                            if (px_byte == 2'd1) begin
+                                busy_o <= 1'b0;
+                                state  <= ST_READY;
+                            end else begin
+                                px_byte <= px_byte + 1;
+                                state   <= ST_PX_SEND;
+                            end
+                        end
+                    end
+                end
+
+            endcase
+        end
+    end
+
+endmodule

@@ -1,0 +1,232 @@
+module sdr_top(
+    input  logic        clk,
+    input  logic        reset,
+    
+    input  logic        enc_a,
+    input  logic        enc_b,
+    
+    input  logic        Vauxp14,
+    input  logic        Vauxn14,
+    input  logic        Vauxp6,
+    input  logic        Vauxn6,
+
+    input  logic        btnr,
+
+    output logic [1:0]  cycle,
+    output logic        pwm_audio_out,
+    output logic [11:0] led,
+
+    output logic        spi_sck,
+    output logic        spi_mosi,
+    output logic        spi_cs_n,
+    output logic        spi_dc,
+    output logic        spi_rst_n,
+    output logic        lcd_backlight
+);
+
+    // Power-On Reset
+    logic [23:0] por_counter;
+    logic        reset_internal;
+
+    always_ff @(posedge clk) begin
+        if (por_counter < 24'd10_000_000)
+            por_counter <= por_counter + 1;
+    end
+    assign reset_internal = (por_counter < 24'd10_000_000) | reset;
+
+    // Local Oscillator
+    logic [31:0] current_channel;
+
+    wave #(
+        .WIDTH   (32),
+        .CLK_FREQ(100_000_000)
+    ) local_oscillator (
+        .clk         (clk),
+        .reset       (reset_internal),
+        .cycle       (cycle),
+        .enc_a       (enc_a),
+        .enc_b       (enc_b),
+        .signal_out  (current_channel)
+    );
+
+    // XADC
+    logic [11:0] adc_i_data;
+    logic [11:0] adc_q_data;
+    logic        adc_data_valid;
+
+    xadc_reader #(
+        .DATA_WIDTH(12)
+    ) xadc_inst (
+        .clk        (clk),
+        .reset      (reset_internal),
+        .Vauxp14    (Vauxp14),
+        .Vauxn14    (Vauxn14),
+        .Vauxp6     (Vauxp6),
+        .Vauxn6     (Vauxn6),
+        .i_data     (adc_i_data),
+        .q_data     (adc_q_data),
+        .data_valid (adc_data_valid),
+        .eoc        (),
+        .eos        ()
+    );
+
+    // DC Removal
+    logic signed [12:0] i_centered;
+    logic signed [12:0] q_centered;
+
+    always_comb begin
+        i_centered = $signed({1'b0, adc_i_data}) - 13'sd2048;
+    end
+
+    // Q channel phase correction
+    logic signed [12:0] q_prev;
+    logic signed [12:0] q_centered_raw;
+
+    always_comb begin
+        q_centered_raw = $signed({1'b0, adc_q_data}) - 13'sd2048;
+    end
+
+    always_ff @(posedge clk) begin
+        if (reset_internal)
+            q_prev <= 13'sd0;
+        else if (adc_data_valid)
+            q_prev <= q_centered_raw;
+    end
+
+    always_comb begin
+        q_centered = (q_centered_raw + ((q_centered_raw - q_prev) >>> 1));
+    end
+
+    // FIR Filter - I and Q
+    logic signed [27:0] fir_i_out;
+    logic signed [27:0] fir_q_out;
+    logic               fir_i_valid;
+    logic               fir_q_valid;
+
+    fir_filter #(
+        .COEFF_WIDTH (16),
+        .DATA_WIDTH  (12),
+        .OUTPUT_WIDTH(28)
+    ) fir_i (
+        .clk           (clk),
+        .reset         (reset_internal),
+        .data_in       (i_centered[11:0]),
+        .data_valid    (adc_data_valid),
+        .data_out      (fir_i_out),
+        .data_out_valid(fir_i_valid)
+    );
+
+    fir_filter #(
+        .COEFF_WIDTH (16),
+        .DATA_WIDTH  (12),
+        .OUTPUT_WIDTH(28)
+    ) fir_q (
+        .clk           (clk),
+        .reset         (reset_internal),
+        .data_in       (q_centered[11:0]),
+        .data_valid    (adc_data_valid),
+        .data_out      (fir_q_out),
+        .data_out_valid(fir_q_valid)
+    );
+
+    // Scale FIR output to 13 bits for CORDIC
+    logic signed [12:0] fir_i_scaled;
+    logic signed [12:0] fir_q_scaled;
+
+    always_comb begin
+        fir_i_scaled = fir_i_out[12:0];
+        fir_q_scaled = fir_q_out[12:0];
+    end
+
+    // AM Demodulator (CORDIC magnitude)
+    logic [12:0] magnitude;
+    logic        magnitude_valid;
+
+    am_demodulator #(
+        .INPUT_WIDTH (13),
+        .OUTPUT_WIDTH(13)
+    ) demodulator (
+        .clk            (clk),
+        .reset          (reset_internal),
+        .i_data         (fir_i_scaled),
+        .q_data         (fir_q_scaled),
+        .data_valid     (fir_i_valid),
+        .magnitude      (magnitude),
+        .magnitude_valid(magnitude_valid)
+    );
+
+    // IIR DC Blocker
+    logic signed [20:0] dc_block_y;
+    logic signed [20:0] dc_block_x_prev;
+    logic signed [12:0] dc_blocked_out;
+    logic               dc_blocked_valid;
+
+    always_ff @(posedge clk) begin
+        if (reset_internal) begin
+            dc_block_y       <= '0;
+            dc_block_x_prev  <= '0;
+            dc_blocked_out   <= '0;
+            dc_blocked_valid <= 1'b0;
+        end else begin
+            dc_blocked_valid <= 1'b0;
+            if (magnitude_valid) begin
+                dc_block_y      <= $signed({1'b0, magnitude})
+                                   - dc_block_x_prev
+                                   + dc_block_y
+                                   - (dc_block_y >>> 7);
+                dc_block_x_prev <= $signed({1'b0, magnitude});
+                dc_blocked_out  <= dc_block_y[12:0];
+                dc_blocked_valid <= 1'b1;
+            end
+        end
+    end
+
+    // PWM DAC
+    pwm_dac #(
+        .INPUT_WIDTH(13),
+        .PWM_BITS   (10)
+    ) audio_dac (
+        .clk        (clk),
+        .reset      (reset_internal),
+        .audio_in   (dc_blocked_out),
+        .audio_valid(dc_blocked_valid),
+        .pwm_out    (pwm_audio_out)
+    );
+
+    // LEDs
+    assign led[11:0] = adc_i_data[11:0];
+
+    // FFT + Display signals
+    logic [15:0] mag_bins [0:255];
+    logic        mag_valid;
+
+    fft_wrapper #(
+        .FRAME_SKIP(8)
+    ) u_fft (
+        .clk      (clk),
+        .reset    (reset_internal),
+        .fir_i    (fir_i_scaled),
+        .fir_q    (fir_q_scaled),
+        .fir_valid(fir_i_valid),
+        .mag_bins (mag_bins),
+        .mag_valid(mag_valid),
+        .led      ()
+    );
+
+    display_top #(
+        .CLK_FREQ(100_000_000)
+    ) u_display (
+        .clk          (clk),
+        .reset        (reset_internal),
+        .mag_bins     (mag_bins),
+        .mag_valid    (mag_valid),
+        .spi_sck      (spi_sck),
+        .spi_mosi     (spi_mosi),
+        .spi_cs_n     (spi_cs_n),
+        .spi_dc       (spi_dc),
+        .spi_rst_n    (spi_rst_n),
+        .lcd_backlight(lcd_backlight),
+        .current_channel(current_channel)
+    );
+
+endmodule

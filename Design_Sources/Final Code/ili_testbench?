@@ -1,0 +1,293 @@
+// =============================================================================
+// tb_ili9488.sv - Testbench for ili9488_controller
+//
+// Run in Vivado: set as simulation top, run Behavioral Simulation
+// Run with iverilog:
+//   iverilog -g2012 -o tb.vvp tb_ili9488.sv ili9488_controller.sv SPI_master.sv
+//   vvp tb.vvp | tee spi_log.txt
+// =============================================================================
+`timescale 1ns/1ps
+
+module tb_ili9488;
+
+    localparam real CLK_PERIOD = 10.0; // 100 MHz
+
+    // Small timing constants so init completes in ~2ms sim time
+    localparam int CLK_FREQ  = 100_000_000;
+    localparam int SPI_FREQ  =  25_000_000;
+    localparam int RST_US    = 1;
+    localparam int WAIT_MS   = 1;
+
+    logic clk   = 0;
+    logic reset = 1;
+    always #(CLK_PERIOD/2) clk = ~clk;
+
+    // DUT ports
+    logic       spi_sck, spi_mosi, spi_cs_n, spi_dc;
+    logic       spi_rst_n, lcd_backlight;
+    logic       draw_valid, draw_ready, disp_ready, disp_busy;
+    logic [4:0] pixel_r;
+    logic [5:0] pixel_g;
+    logic [4:0] pixel_b;
+
+    ili9488_controller #(
+        .CLK_FREQ(CLK_FREQ),
+        .SPI_FREQ(SPI_FREQ),
+        .RST_US  (RST_US),
+        .WAIT_MS (WAIT_MS)
+    ) dut (
+        .clk          (clk),
+        .reset        (reset),
+        .spi_sck      (spi_sck),
+        .spi_mosi     (spi_mosi),
+        .spi_cs_n     (spi_cs_n),
+        .spi_dc       (spi_dc),
+        .spi_rst_n    (spi_rst_n),
+        .lcd_backlight(lcd_backlight),
+        .draw_valid_i (draw_valid),
+        .pixel_r_i    (pixel_r),
+        .pixel_g_i    (pixel_g),
+        .pixel_b_i    (pixel_b),
+        .draw_ready_o (draw_ready),
+        .ready_o      (disp_ready),
+        .busy_o       (disp_busy)
+    );
+
+    // -------------------------------------------------------------------------
+    // SPI monitor - samples MOSI on SCK rising edge, prints complete bytes
+    // -------------------------------------------------------------------------
+    logic [7:0] shift_reg  = 8'h00;
+    integer     bit_pos    = 7;       // counts down 7..0
+    logic       sck_prev   = 1'b0;
+    integer     byte_num   = 0;
+    integer     cs_events  = 0;
+    logic       cs_prev    = 1'b1;
+
+    // Snapshot CS/DC at the start of each byte (first SCK rising edge)
+    logic snap_cs = 1'b1;
+    logic snap_dc = 1'b0;
+    logic first_bit = 1'b1; // true until first bit of current byte is seen
+
+    always @(posedge clk) begin
+        sck_prev <= spi_sck;
+        cs_prev  <= spi_cs_n;
+
+        // Detect CS rising edge (deassert)
+        if (spi_cs_n && !cs_prev) begin
+            cs_events <= cs_events + 1;
+            $display("  [CS deasserted - event %0d at %0t]", cs_events+1, $time);
+        end
+
+        // Detect SCK rising edge - sample MOSI (SPI mode 0)
+        if (spi_sck && !sck_prev) begin
+
+            // Snapshot CS/DC on first bit of each byte
+            if (first_bit) begin
+                snap_cs   <= spi_cs_n;
+                snap_dc   <= spi_dc;
+                first_bit <= 1'b0;
+            end
+
+            shift_reg[bit_pos] <= spi_mosi;
+
+            if (bit_pos == 0) begin
+                // Full byte received - print it
+                print_byte(byte_num, snap_cs, snap_dc, {shift_reg[7:1], spi_mosi});
+                byte_num  <= byte_num + 1;
+                bit_pos   <= 7;
+                shift_reg <= 8'h00;
+                first_bit <= 1'b1;
+            end else begin
+                bit_pos <= bit_pos - 1;
+            end
+        end
+    end
+
+    task automatic print_byte(
+        input integer  n,
+        input logic    cs,
+        input logic    dc,
+        input logic [7:0] val
+    );
+        string kind, note;
+        kind = (dc == 0) ? "CMD " : "DATA";
+        note = "";
+        if (dc == 0) begin
+            case (val)
+                8'h11: note = " SLPOUT";
+                8'h29: note = " DISPON";
+                8'h2A: note = " CASET";
+                8'h2B: note = " PASET";
+                8'h2C: note = " RAMWR <<<";
+                8'h36: note = " MADCTL";
+                8'h3A: note = " COLMOD";
+                8'hB0: note = " IFMODE";
+                8'hB1: note = " FRMCTR1";
+                8'hB4: note = " INVTR";
+                8'hB6: note = " DISCTRL";
+                8'hC0: note = " PWCTRL1";
+                8'hC1: note = " PWCTRL2";
+                8'hC5: note = " VCMPCTL";
+                8'hE0: note = " PGAMCTRL";
+                8'hE1: note = " NGAMCTRL";
+                8'hF7: note = " ADJCTRL3";
+                default: note = " ???UNKNOWN???";
+            endcase
+        end
+
+        $display("[%3d] CS=%b DC=%b  0x%02H  %s%s", n, cs, dc, val, kind, note);
+
+        // Checks
+        if (cs !== 1'b0)
+            $display("  *** ERROR: CS was HIGH during byte %0d ***", n);
+        if (val == 8'h2C && dc !== 1'b0)
+            $display("  *** ERROR: RAMWR sent as DATA (dc=1), should be CMD (dc=0) ***");
+
+    endtask
+
+    // -------------------------------------------------------------------------
+    // Pixel checker - verifies RGB565 encoding after RAMWR
+    // -------------------------------------------------------------------------
+    localparam logic [4:0] TEST_R  = 5'h1F;
+    localparam logic [5:0] TEST_G  = 6'h00;
+    localparam logic [4:0] TEST_B  = 5'h00;
+    localparam logic [7:0] EXP_HI  = {TEST_R, TEST_G[5:3]};  // 0xF8
+    localparam logic [7:0] EXP_LO  = {TEST_G[2:0], TEST_B};  // 0x00
+
+    logic        past_ramwr   = 1'b0;
+    integer      data_bytes   = 0;
+    logic [7:0]  hi_byte      = 8'h00;
+    integer      pairs_ok     = 0;
+    integer      pairs_fail   = 0;
+
+    // Watch the byte stream after RAMWR
+    // We re-use the byte_num counter edge to detect new bytes
+    integer byte_num_prev = 0;
+    always @(posedge clk) begin
+        if (byte_num != byte_num_prev) begin
+            byte_num_prev <= byte_num;
+            // The last completed byte is in shift_reg before it cleared -
+            // we can't easily re-read it here, so use the pixel checker below
+        end
+    end
+
+    // Separate always block watching sck edges for pixel checking
+    logic sck_prev2 = 0;
+    logic [7:0] sr2 = 0;
+    integer bp2 = 7;
+    logic fb2 = 1;
+    logic dc_snap2 = 0;
+
+    always @(posedge clk) begin
+        sck_prev2 <= spi_sck;
+        if (spi_sck && !sck_prev2) begin
+            if (fb2) begin dc_snap2 <= spi_dc; fb2 <= 0; end
+            sr2[bp2] <= spi_mosi;
+            if (bp2 == 0) begin
+                logic [7:0] completed;
+                completed = {sr2[7:1], spi_mosi};
+                // Check for RAMWR command
+                if (dc_snap2 == 0 && completed == 8'h2C)
+                    past_ramwr <= 1'b1;
+                // Check pixel data bytes
+                if (past_ramwr && dc_snap2 == 1) begin
+                    if (data_bytes % 2 == 0) begin
+                        hi_byte <= completed;
+                        if (completed !== EXP_HI)
+                            $display("  *** PIXEL FAIL: hi byte=0x%02H expected=0x%02H ***",
+                                     completed, EXP_HI);
+                    end else begin
+                        if (completed !== EXP_LO || hi_byte !== EXP_HI) begin
+                            $display("  *** PIXEL FAIL pair %0d: 0x%02H 0x%02H (expected 0x%02H 0x%02H) ***",
+                                     data_bytes/2, hi_byte, completed, EXP_HI, EXP_LO);
+                            pairs_fail <= pairs_fail + 1;
+                        end else begin
+                            $display("  PIXEL OK pair %0d: 0x%02H 0x%02H",
+                                     data_bytes/2, hi_byte, completed);
+                            pairs_ok <= pairs_ok + 1;
+                        end
+                    end
+                    data_bytes <= data_bytes + 1;
+                end
+                bp2 <= 7;
+                sr2 <= 8'h00;
+                fb2 <= 1;
+            end else
+                bp2 <= bp2 - 1;
+        end
+    end
+
+    // -------------------------------------------------------------------------
+    // Stimulus
+    // -------------------------------------------------------------------------
+    initial begin
+        draw_valid = 1'b0;
+        pixel_r    = TEST_R;
+        pixel_g    = TEST_G;
+        pixel_b    = TEST_B;
+
+        $display("=== tb_ili9488 starting ===");
+        $display("Expected RGB565 for full red: HI=0x%02H LO=0x%02H", EXP_HI, EXP_LO);
+
+        repeat(5) @(posedge clk);
+        reset = 1'b0;
+        $display("--- Reset released at %0t ---", $time);
+
+        // Wait for init complete - with verbose seq_idx monitoring
+        fork
+            begin
+                @(posedge disp_ready);
+            end
+            begin
+                // Monitor seq_idx changes
+                logic [6:0] last_idx = 7'hFF;
+                forever begin
+                    @(posedge clk);
+                    if (dut.seq_idx !== last_idx) begin
+                        $display("  seq_idx changed: %0d -> %0d  state=%s  t=%0t",
+                                 last_idx, dut.seq_idx, dut.state.name(), $time);
+                        last_idx = dut.seq_idx;
+                    end
+                end
+            end
+        join_any
+        disable fork;
+        $display("--- disp_ready HIGH at %0t ---", $time);
+        $display("    lcd_backlight = %b (expect 1)", lcd_backlight);
+        $display("    spi_rst_n     = %b (expect 1)", spi_rst_n);
+        $display("    spi_cs_n      = %b (expect 0, held low for pixel stream)", spi_cs_n);
+        $display("    spi_dc        = %b (expect 1, data phase)", spi_dc);
+
+        if (!lcd_backlight) $display("  *** ERROR: backlight not on after init ***");
+        if (!spi_rst_n)     $display("  *** ERROR: rst_n still low after init ***");
+
+        // Send 5 test pixels using proper handshake
+        $display("--- Sending 5 pixels ---");
+        repeat(5) begin
+            // Wait for controller ready
+            wait(disp_ready && !disp_busy);
+            @(posedge clk);
+            draw_valid = 1'b1;
+            @(posedge draw_ready);   // wait for ack
+            @(posedge clk);
+            draw_valid = 1'b0;
+            wait(!disp_busy);        // wait for SPI done
+            @(posedge clk);
+        end
+
+        repeat(20) @(posedge clk);
+        $display("=== Done: %0d bytes total, %0d CS events, %0d pixel pairs OK, %0d FAIL ===",
+                 byte_num, cs_events, pairs_ok, pairs_fail);
+        $finish;
+    end
+
+    // Watchdog
+    initial begin
+        #200_000_000;
+        $display("*** WATCHDOG TIMEOUT - controller is stuck ***");
+        $display("    State at timeout: disp_ready=%b disp_busy=%b spi_cs_n=%b",
+                 disp_ready, disp_busy, spi_cs_n);
+        $finish;
+    end
+
+endmodule

@@ -1,0 +1,32 @@
+// dc_test: bare minimum test - just toggles DC low then high
+// to prove the pin can change state.
+// If DC is still permanently high after this, the issue is
+// in the XDC pin assignment or physical wiring, not the code.
+
+module dc_test (
+    input  logic clk,
+    input  logic reset,
+    output logic spi_dc,
+    output logic [7:0] led
+);
+    logic [26:0] cnt;
+    logic        dc_reg;
+
+    always_ff @(posedge clk) begin
+        if (reset) begin
+            cnt    <= '0;
+            dc_reg <= 1'b0;
+        end else begin
+            cnt <= cnt + 1;
+            // Toggle DC every 0.5 seconds
+            if (cnt == 27'd50_000_000) begin
+                cnt    <= '0;
+                dc_reg <= ~dc_reg;
+            end
+        end
+    end
+
+    assign spi_dc  = dc_reg;
+    assign led     = {7'b0, dc_reg};
+
+endmodule

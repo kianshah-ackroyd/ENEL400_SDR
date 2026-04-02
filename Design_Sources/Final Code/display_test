@@ -1,0 +1,296 @@
+// display_top.sv
+// ILI9341 320x240 landscape display renderer
+// Top 80px: station text. Bottom 160px: FFT bar chart.
+
+module display_top #(
+    parameter int CLK_FREQ = 100_000_000
+)(
+    input  logic        clk,
+    input  logic        reset,
+
+    input  logic [15:0] mag_bins [0:255],
+    input  logic        mag_valid,
+    input  logic [31:0] current_channel,
+
+    output logic        spi_sck,
+    output logic        spi_mosi,
+    output logic        spi_cs_n,
+    output logic        spi_dc,
+    output logic        spi_rst_n,
+    output logic        lcd_backlight
+);
+
+    localparam int SCREEN_W      = 320;
+    localparam int SCREEN_H      = 240;
+    localparam int SCREEN_PIXELS = SCREEN_W * SCREEN_H;
+    localparam int FFT_TOP       = 80;
+    localparam int FFT_HEIGHT    = 160;
+    localparam int BINS_USED     = 32;
+    localparam int PX_PER_BIN    = SCREEN_W / BINS_USED; // 10
+
+    localparam int TEXT_LEN = 17;
+    localparam int TEXT_X   = 8;
+    localparam int TEXT_Y   = 8;
+    localparam int CHAR_W   = 16;
+    localparam int CHAR_H   = 32;
+    
+    logic [2:0] station_index;
+    
+    always_comb begin
+        case (current_channel)
+            32'd660_000: station_index <= 3'd0;
+            32'd700_000: station_index <= 3'd1;
+            32'd770_000: station_index <= 3'd2;
+            32'd960_000: station_index <= 3'd3;
+            32'd1_010_000: station_index <= 3'd4;
+            32'd1_140_000: station_index <= 3'd5;
+            default: station_index <= 3'd0;
+        endcase
+    end
+        logic [7:0] station_char;
+        
+    logic [9:0]  rel_x;
+    logic [7:0]  rel_y;
+    logic [9:0]  char_col;
+    assign char_col       = rel_x / CHAR_W;
+    
+    
+    always_comb begin
+        station_char = 8'h20;
+        case (station_index)
+            3'd0: case (char_col)
+                10'd0: station_char = 8'h43; //C
+                10'd1: station_char = 8'h69; //i
+                10'd2: station_char = 8'h74; //t
+                10'd3: station_char = 8'h79; //y
+                10'd4: station_char = 8'h4E; //N
+                10'd5: station_char = 8'h65; //e
+                10'd6: station_char = 8'h77; //w
+                10'd7: station_char = 8'h73; //s
+                10'd8: station_char = 8'h20; //space
+                10'd9: station_char = 8'h36; //6
+                10'd10: station_char = 8'h36; //6
+                10'd11: station_char = 8'h30; //0
+                endcase
+            3'd1: case (char_col)
+                10'd0: station_char = 8'h54; //T
+                10'd1: station_char = 8'h68; //h
+                10'd2: station_char = 8'h65; //e
+                10'd3: station_char = 8'h20; //space
+                10'd4: station_char = 8'h4C; //L
+                10'd5: station_char = 8'h69; //i
+                10'd6: station_char = 8'h67; //g
+                10'd7: station_char = 8'h68; //h
+                10'd8: station_char = 8'h74; //t
+                10'd9: station_char = 8'h20; //space
+                10'd10: station_char = 8'h37; //7
+                10'd11: station_char = 8'h30; //0
+                10'd12: station_char = 8'h30; //0
+                endcase
+            3'd2: case (char_col)
+                10'd0: station_char = 8'h51; //Q
+                10'd1: station_char = 8'h52; //R
+                10'd2: station_char = 8'h20; //space
+                10'd3: station_char = 8'h43; //C
+                10'd4: station_char = 8'h61; //a
+                10'd5: station_char = 8'h6C; //l
+                10'd6: station_char = 8'h67; //g
+                10'd7: station_char = 8'h61; //a
+                10'd8: station_char = 8'h72; //r
+                10'd9: station_char = 8'h79; //y
+                10'd10: station_char = 8'h20; //space
+                10'd11: station_char = 8'h37; //7
+                10'd12: station_char = 8'h37; //7
+                10'd13: station_char = 8'h30; //0
+                endcase
+            3'd3: case (char_col)
+                10'd0: station_char = 8'h54; //T
+                10'd1: station_char = 8'h68; //h
+                10'd2: station_char = 8'h65; //e
+                10'd3: station_char = 8'h20; //space
+                10'd4: station_char = 8'h46; //F
+                10'd5: station_char = 8'h61; //a
+                10'd6: station_char = 8'h6E; //n
+                10'd7: station_char = 8'h20; //space
+                10'd8: station_char = 8'h39; //9
+                10'd9: station_char = 8'h36; //6
+                10'd10: station_char = 8'h30; //0
+                endcase
+            3'd4: case (char_col)
+                10'd0: station_char = 8'h43; //C
+                10'd1: station_char = 8'h42; //B
+                10'd2: station_char = 8'h43; //C
+                10'd3: station_char = 8'h20; //space
+                10'd4: station_char = 8'h52; //R
+                10'd5: station_char = 8'h61; //a
+                10'd6: station_char = 8'h64; //d
+                10'd7: station_char = 8'h69; //i
+                10'd8: station_char = 8'h6F; //o
+                10'd9: station_char = 8'h20; //space
+                10'd10: station_char = 8'h31; //1
+                10'd11: station_char = 8'h30; //0
+                10'd12: station_char = 8'h31; //1
+                10'd13: station_char = 8'h30; //0
+                endcase
+            3'd5: case (char_col)
+                10'd0: station_char = 8'h43; //C
+                10'd1: station_char = 8'h48; //H
+                10'd2: station_char = 8'h52; //R
+                10'd3: station_char = 8'h42; //B
+                10'd4: station_char = 8'h20; //space
+                10'd5: station_char = 8'h31; //1
+                10'd6: station_char = 8'h31; //1
+                10'd7: station_char = 8'h34; //4
+                10'd8: station_char = 8'h30; //0
+                endcase
+         endcase
+    end    
+//bar 
+    logic [7:0]  bar_work    [0:SCREEN_W-1];
+    logic [7:0]  bar_display [0:SCREEN_W-1];
+    logic [15:0] scaled_mag;
+    integer      col_idx;
+    integer      bin_idx;
+
+    always_ff @(posedge clk or posedge reset) begin
+        if (reset) begin
+            for (col_idx = 0; col_idx < SCREEN_W; col_idx = col_idx + 1)
+                bar_work[col_idx] <= 8'd0;
+        end else if (mag_valid) begin
+            for (col_idx = 0; col_idx < SCREEN_W; col_idx = col_idx + 1) begin
+                bin_idx    = col_idx / PX_PER_BIN + 1;
+                scaled_mag = mag_bins[bin_idx] >> 6;
+                bar_work[col_idx] <= (scaled_mag > 16'd160) ? 8'd160
+                                                             : scaled_mag[7:0];
+            end
+        end
+    end
+
+
+    logic [$clog2(SCREEN_PIXELS)-1:0] pixel_cnt;
+    logic [8:0] px_x;
+    logic [7:0] px_y;
+
+    logic draw_valid, draw_ready, disp_ready, disp_busy;
+    assign draw_valid = disp_ready && !disp_busy;
+
+    always_ff @(posedge clk or posedge reset) begin
+        if (reset) begin
+            pixel_cnt <= '0;
+            px_x      <= '0;
+            px_y      <= '0;
+            for (col_idx = 0; col_idx < SCREEN_W; col_idx = col_idx + 1)
+                bar_display[col_idx] <= 8'd0;
+        end else if (draw_ready) begin
+            if (pixel_cnt == 0) begin
+                for (col_idx = 0; col_idx < SCREEN_W; col_idx = col_idx + 1)
+                    bar_display[col_idx] <= bar_work[col_idx];
+            end
+            if (pixel_cnt == SCREEN_PIXELS - 1) begin
+                pixel_cnt <= '0;
+                px_x      <= '0;
+                px_y      <= '0;
+            end else begin
+                pixel_cnt <= pixel_cnt + 1;
+                if (px_x == SCREEN_W - 1) begin
+                    px_x <= '0;
+                    px_y <= px_y + 1;
+                end else
+                    px_x <= px_x + 1;
+            end
+        end
+    end
+
+//font
+
+    logic [2:0]  char_bit_x;
+    logic [3:0]  char_bit_y;
+    logic [7:0]  font_char;
+    logic [3:0]  font_row;
+    logic [7:0]  font_row_data;
+    logic        in_text_region;
+    logic        font_pixel;
+
+    assign rel_x          = 10'(px_x) - TEXT_X;
+    assign rel_y          = 8'(px_y)  - TEXT_Y;
+    assign char_bit_x     = rel_x[3:1];
+    assign char_bit_y     = rel_y[4:1];
+    assign font_char = (char_col < TEXT_LEN) ? station_char : 8'h00;
+    assign font_row       = char_bit_y;
+    assign in_text_region = (px_x >= 9'(TEXT_X)) &&
+                            (px_x <  9'(TEXT_X + TEXT_LEN * CHAR_W)) &&
+                            (px_y >= 8'(TEXT_Y)) &&
+                            (px_y <  8'(TEXT_Y + CHAR_H));
+    assign font_pixel     = font_row_data[7 - char_bit_x];
+
+    font_rom u_font (
+        .char    (font_char),
+        .row     (font_row),
+        .row_data(font_row_data)
+    );
+
+
+    logic [4:0] px_r;
+    logic [5:0] px_g;
+    logic [4:0] px_b;
+    logic [7:0] bar_threshold;
+
+    // Bar outline logic: left edge = first pixel of each bin, top edge = bar_threshold row
+    logic       is_left_edge;
+    logic       is_top_edge;
+    logic       in_bar;
+
+    always_comb begin
+        bar_threshold = 8'(FFT_TOP + FFT_HEIGHT) - bar_display[px_x];
+        is_left_edge  = (px_x % PX_PER_BIN == 0);
+        is_top_edge   = (px_y == bar_threshold) && (bar_display[px_x] > 0);
+        in_bar        = (px_y >= bar_threshold);
+
+        if (px_y < 8'(FFT_TOP)) begin
+            if (in_text_region && font_pixel)
+                begin px_r = 5'h1F; px_g = 6'h3F; px_b = 5'h1F; end
+            else
+                begin px_r = 5'h00; px_g = 6'h00; px_b = 5'h00; end
+        end else if (in_bar && (is_left_edge || is_top_edge)) begin
+            // Outline
+            px_r = 5'h1F; px_g = 6'h00; px_b = 5'h1F;
+        end else if (in_bar) begin
+            // Bar fill 
+            px_r = 5'h18; px_g = 6'h1C; px_b = 5'h1F;
+        end else begin
+            // Background
+            px_r = 5'h00; px_g = 6'h00; px_b = 5'h00;
+        end
+    end
+
+
+    ili9341_controller #(
+        .CLK_FREQ(CLK_FREQ),
+        .SPI_FREQ(25_000_000),
+        .RST_US  (20),
+        .WAIT_MS (150)
+    ) u_display (
+        .clk          (clk),
+        .reset        (reset),
+        .spi_sck      (spi_sck),
+        .spi_mosi     (spi_mosi),
+        .spi_cs_n     (spi_cs_n),
+        .spi_dc       (spi_dc),
+        .spi_rst_n    (spi_rst_n),
+        .lcd_backlight(lcd_backlight),
+        .draw_valid_i (draw_valid),
+        .pixel_r_i    (px_r),
+        .pixel_g_i    (px_g),
+        .pixel_b_i    (px_b),
+        .draw_ready_o (draw_ready),
+        .ready_o      (disp_ready),
+        .busy_o       (disp_busy),
+        .win_valid_i  (1'b0),
+        .win_x0_i     ('0),
+        .win_x1_i     ('0),
+        .win_y0_i     ('0),
+        .win_y1_i     ('0),
+        .win_ready_o  ()
+    );
+
+endmodule

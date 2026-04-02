@@ -1,0 +1,256 @@
+// Module: fft_wrapper
+// Description: Feeds complex I/Q samples from the FIR filter into the
+//              Xilinx FFT IP (xfft_0, 512-point complex).
+//
+//              Input:  fir_i_scaled / fir_q_scaled (13-bit signed, 200kSPS)
+//              Output: mag_bins[] - magnitude of each FFT bin (256 bins)
+//                      mag_valid  - pulses high when a full frame is ready
+//                      led        - shows the peak bin index for debug
+//
+// FFT input packing (per Xilinx PG109):
+//   s_axis_data_tdata[15:0]  = I (real), sign-extended to 16 bits
+//   s_axis_data_tdata[31:16] = Q (imag), sign-extended to 16 bits
+//
+// Output packing:
+//   m_axis_data_tdata[15:0]  = Re (real output)
+//   m_axis_data_tdata[31:16] = Im (imag output)
+//
+// Magnitude approximation:
+//   |Re| + |Im|  (alpha max plus beta min would be better but this is fine
+//   for a visualiser - we just need relative magnitudes to look right)
+//
+// Decimation:
+//   FIR fires at 200kSPS. We take every sample (no decimation).
+//   512 samples collected -> FFT kicked off -> 512 bins out.
+//   Frame rate = 200k / 512 = ~391 fps. We latch a new display frame
+//   every FRAME_SKIP FFT frames to avoid unnecessary switching.
+//
+// LED debug output:
+//   Shows which bin (0-7 mapped to LEDs) has the highest magnitude.
+//   Useful for verifying FFT is responding to a real signal.
+
+module fft_wrapper #(
+    parameter int FRAME_SKIP = 8   // Only update display every N FFT frames
+)(
+    input  logic        clk,
+    input  logic        reset,
+
+    // From FIR filter (sdr_top.sv signals)
+    input  logic signed [12:0]  fir_i,
+    input  logic signed [12:0]  fir_q,
+    input  logic                fir_valid,
+
+    // Magnitude output - 256 bins (positive frequencies only)
+    // Each bin is 16-bit magnitude value
+    output logic [15:0] mag_bins [0:255],
+    output logic        mag_valid,   // pulses when new frame is ready
+
+    // LED debug - peak bin indicator
+    output logic [7:0]  led
+);
+
+    // -------------------------------------------------------------------------
+    // Sample collection FIFO / frame buffer
+    // Collect 512 samples then kick off the FFT
+    // -------------------------------------------------------------------------
+    logic [9:0]  sample_cnt;      // 0 to 511
+    logic        fft_frame_start; // pulse: we have 512 samples ready
+
+    // Pack I/Q into 32-bit tdata
+    // Sign-extend 13-bit to 16-bit
+    logic [31:0] fft_tdata;
+    always_comb begin
+        fft_tdata[15:0]  = {{3{fir_i[12]}}, fir_i};   // sign extend I to 16b
+        fft_tdata[31:16] = {{3{fir_q[12]}}, fir_q};   // sign extend Q to 16b
+    end
+
+    // -------------------------------------------------------------------------
+    // FFT IP control signals
+    // -------------------------------------------------------------------------
+    logic        fft_s_valid;
+    logic        fft_s_ready;
+    logic [31:0] fft_s_tdata;
+    logic        fft_s_tlast;     // marks last sample of frame
+
+    logic        fft_m_valid;
+    logic [31:0] fft_m_tdata;
+    logic        fft_m_tlast;     // marks last bin of frame
+
+    // Forward/inverse config: 1 = forward FFT
+    logic        fft_config_valid;
+    logic [7:0]  fft_config_tdata;
+    assign fft_config_tdata  = 8'h01;  // forward FFT
+    assign fft_config_valid  = 1'b1;   // always forward
+
+    // -------------------------------------------------------------------------
+    // Input state machine
+    // Feeds samples into the FFT one at a time as they arrive from FIR
+    // -------------------------------------------------------------------------
+    typedef enum logic [1:0] {
+        IN_COLLECT,   // counting samples, waiting for 512
+        IN_FEED,      // actively feeding this sample to FFT
+        IN_WAIT       // FFT not ready yet, hold sample
+    } in_state_t;
+
+    in_state_t in_state;
+    logic [31:0] held_tdata;
+    logic        held_tlast;
+
+    always_ff @(posedge clk) begin
+        if (reset) begin
+            in_state     <= IN_COLLECT;
+            sample_cnt   <= '0;
+            fft_s_valid  <= 1'b0;
+            fft_s_tdata  <= '0;
+            fft_s_tlast  <= 1'b0;
+        end else begin
+            fft_s_valid <= 1'b0;
+
+            case (in_state)
+                IN_COLLECT: begin
+                    if (fir_valid) begin
+                        held_tdata <= fft_tdata;
+                        held_tlast <= (sample_cnt == 10'd511);
+                        fft_s_tdata <= fft_tdata;
+                        fft_s_tlast <= (sample_cnt == 10'd511);
+                        fft_s_valid <= 1'b1;
+
+                        if (sample_cnt == 10'd511)
+                            sample_cnt <= '0;
+                        else
+                            sample_cnt <= sample_cnt + 1;
+
+                        if (!fft_s_ready)
+                            in_state <= IN_WAIT;
+                    end
+                end
+
+                IN_WAIT: begin
+                    // Hold last sample until FFT is ready
+                    fft_s_tdata <= held_tdata;
+                    fft_s_tlast <= held_tlast;
+                    fft_s_valid <= 1'b1;
+                    if (fft_s_ready)
+                        in_state <= IN_COLLECT;
+                end
+            endcase
+        end
+    end
+
+    // -------------------------------------------------------------------------
+    // Xilinx FFT IP instance
+    // -------------------------------------------------------------------------
+    xfft_0 fft_inst (
+        .aclk                        (clk),
+
+        // Config: forward/inverse select
+        .s_axis_config_tdata         (fft_config_tdata),
+        .s_axis_config_tvalid        (fft_config_valid),
+        .s_axis_config_tready        (),   // ignore - always ready after reset
+
+        // Input data
+        .s_axis_data_tdata           (fft_s_tdata),
+        .s_axis_data_tvalid          (fft_s_valid),
+        .s_axis_data_tready          (fft_s_ready),
+        .s_axis_data_tlast           (fft_s_tlast),
+
+        // Output data
+        .m_axis_data_tdata           (fft_m_tdata),
+        .m_axis_data_tvalid          (fft_m_valid),
+        .m_axis_data_tready          (1'b1),   // always accept output
+        .m_axis_data_tlast           (fft_m_tlast),
+
+        // Status (unused)
+        .event_frame_started         (),
+        .event_tlast_unexpected      (),
+        .event_tlast_missing         (),
+        .event_status_channel_halt   (),
+        .event_data_in_channel_halt  (),
+        .event_data_out_channel_halt ()
+    );
+
+    // -------------------------------------------------------------------------
+    // Output bin collection
+    // As bins stream out, compute magnitude and store in mag_bins[]
+    // Only latch a new display frame every FRAME_SKIP frames
+    // -------------------------------------------------------------------------
+    logic [9:0]  bin_cnt;          // which bin we're receiving (0-511)
+    logic [7:0]  frame_cnt;        // how many frames we've received
+    logic [15:0] mag_work [0:255]; // working buffer (fills during current frame)
+
+    // Magnitude: |Re| + |Im| approximation
+    logic signed [15:0] fft_re, fft_im;
+    logic [15:0]        fft_mag;
+
+    always_comb begin
+        fft_re  = $signed(fft_m_tdata[15:0]);
+        fft_im  = $signed(fft_m_tdata[31:16]);
+        // Absolute value of each then sum
+        fft_mag = (fft_re[15] ? (~fft_re + 1'b1) : fft_re)
+                + (fft_im[15] ? (~fft_im + 1'b1) : fft_im);
+    end
+
+    always_ff @(posedge clk) begin
+        if (reset) begin
+            bin_cnt   <= '0;
+            frame_cnt <= '0;
+            mag_valid <= 1'b0;
+            for (int i = 0; i < 256; i++) begin
+                mag_bins[i] <= '0;
+                mag_work[i] <= '0;
+            end
+        end else begin
+            mag_valid <= 1'b0;
+
+            if (fft_m_valid) begin
+                // Only store bins 0-255 (positive frequencies)
+                if (bin_cnt < 256)
+                    mag_work[bin_cnt[7:0]] <= fft_mag;
+
+                if (fft_m_tlast) begin
+                    // End of frame
+                    bin_cnt   <= '0;
+                    frame_cnt <= frame_cnt + 1;
+
+                    // Every FRAME_SKIP frames, latch working buffer to output
+                    if (frame_cnt == FRAME_SKIP - 1) begin
+                        frame_cnt <= '0;
+                        for (int i = 0; i < 256; i++)
+                            mag_bins[i] <= mag_work[i];
+                        mag_valid <= 1'b1;
+                    end
+                end else begin
+                    bin_cnt <= bin_cnt + 1;
+                end
+            end
+        end
+    end
+
+    // -------------------------------------------------------------------------
+    // LED debug: find peak bin in first 32 bins (0-8kHz audio range)
+    // Map peak bin index [4:0] to 8 LEDs as a bar
+    // -------------------------------------------------------------------------
+    logic [15:0] peak_mag;
+    logic [4:0]  peak_bin;
+
+    always_ff @(posedge clk) begin
+        if (reset) begin
+            peak_mag <= '0;
+            peak_bin <= '0;
+            led      <= '0;
+        end else if (mag_valid) begin
+            peak_mag <= '0;
+            peak_bin <= '0;
+            // Search bins 1-31 (skip DC at bin 0)
+            for (int i = 1; i < 32; i++) begin
+                if (mag_bins[i] > peak_mag) begin
+                    peak_mag <= mag_bins[i];
+                    peak_bin <= i[4:0];
+                end
+            end
+            // Show peak magnitude as a bar on LEDs (upper 8 bits of peak_mag)
+            led <= peak_mag[15:8];
+        end
+    end
+
+endmodule

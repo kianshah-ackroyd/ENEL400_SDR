@@ -1,0 +1,143 @@
+// SPI Master - converted to SystemVerilog
+// Original: Russell Merrick / nandland.com
+//
+// Parameters:
+//   SPI_MODE         - 0,1,2,3 (use 0 for ILI9488)
+//   CLKS_PER_HALF_BIT - e.g. 2 gives 25MHz SPI from 100MHz clk
+//
+// Usage for ILI9488:
+//   Instantiate with SPI_MODE=0, CLKS_PER_HALF_BIT=2
+//   CS and D/C are NOT handled here - manage them in your controller above this
+
+module SPI_master #(
+    parameter int SPI_MODE         = 0,
+    parameter int CLKS_PER_HALF_BIT = 2
+)(
+    input  logic        i_Rst_L,
+    input  logic        i_Clk,
+
+    // TX
+    input  logic [7:0]  i_TX_Byte,
+    input  logic        i_TX_DV,
+    output logic        o_TX_Ready,
+
+    // RX (not needed for display, but kept for completeness)
+    output logic        o_RX_DV,
+    output logic [7:0]  o_RX_Byte,
+
+    // SPI pins
+    output logic        o_SPI_Clk,
+    input  logic        i_SPI_MISO,
+    output logic        o_SPI_MOSI
+);
+
+    // Clock polarity and phase decoded from mode
+    logic w_CPOL, w_CPHA;
+    assign w_CPOL = (SPI_MODE == 2) || (SPI_MODE == 3);
+    assign w_CPHA = (SPI_MODE == 1) || (SPI_MODE == 3);
+
+    logic [$clog2(CLKS_PER_HALF_BIT*2)-1:0] r_SPI_Clk_Count;
+    logic        r_SPI_Clk;
+    logic [4:0]  r_SPI_Clk_Edges;
+    logic        r_Leading_Edge;
+    logic        r_Trailing_Edge;
+    logic        r_TX_DV;
+    logic [7:0]  r_TX_Byte;
+    logic [2:0]  r_RX_Bit_Count;
+    logic [2:0]  r_TX_Bit_Count;
+
+    // Generate SPI clock edges
+    always_ff @(posedge i_Clk or negedge i_Rst_L) begin
+        if (~i_Rst_L) begin
+            o_TX_Ready      <= 1'b0;
+            r_SPI_Clk_Edges <= '0;
+            r_Leading_Edge  <= 1'b0;
+            r_Trailing_Edge <= 1'b0;
+            r_SPI_Clk       <= w_CPOL;
+            r_SPI_Clk_Count <= '0;
+        end else begin
+            r_Leading_Edge  <= 1'b0;
+            r_Trailing_Edge <= 1'b0;
+
+            if (i_TX_DV) begin
+                o_TX_Ready      <= 1'b0;
+                r_SPI_Clk_Edges <= 5'd16;
+            end else if (r_SPI_Clk_Edges > 0) begin
+                o_TX_Ready <= 1'b0;
+                if (r_SPI_Clk_Count == CLKS_PER_HALF_BIT * 2 - 1) begin
+                    r_SPI_Clk_Edges <= r_SPI_Clk_Edges - 1'b1;
+                    r_Trailing_Edge <= 1'b1;
+                    r_SPI_Clk_Count <= '0;
+                    r_SPI_Clk       <= ~r_SPI_Clk;
+                end else if (r_SPI_Clk_Count == CLKS_PER_HALF_BIT - 1) begin
+                    r_SPI_Clk_Edges <= r_SPI_Clk_Edges - 1'b1;
+                    r_Leading_Edge  <= 1'b1;
+                    r_SPI_Clk_Count <= r_SPI_Clk_Count + 1'b1;
+                    r_SPI_Clk       <= ~r_SPI_Clk;
+                end else begin
+                    r_SPI_Clk_Count <= r_SPI_Clk_Count + 1'b1;
+                end
+            end else begin
+                o_TX_Ready <= 1'b1;
+            end
+        end
+    end
+
+    // Latch TX byte on DV pulse
+    always_ff @(posedge i_Clk or negedge i_Rst_L) begin
+        if (~i_Rst_L) begin
+            r_TX_Byte <= 8'h00;
+            r_TX_DV   <= 1'b0;
+        end else begin
+            r_TX_DV <= i_TX_DV;
+            if (i_TX_DV)
+                r_TX_Byte <= i_TX_Byte;
+        end
+    end
+
+    // Generate MOSI
+    always_ff @(posedge i_Clk or negedge i_Rst_L) begin
+        if (~i_Rst_L) begin
+            o_SPI_MOSI     <= 1'b0;
+            r_TX_Bit_Count <= 3'b111;
+        end else begin
+            if (o_TX_Ready)
+                r_TX_Bit_Count <= 3'b111;
+            else if (r_TX_DV & ~w_CPHA) begin
+                o_SPI_MOSI     <= r_TX_Byte[7];
+                r_TX_Bit_Count <= 3'b110;
+            end else if ((r_Leading_Edge & w_CPHA) | (r_Trailing_Edge & ~w_CPHA)) begin
+                r_TX_Bit_Count <= r_TX_Bit_Count - 1'b1;
+                o_SPI_MOSI     <= r_TX_Byte[r_TX_Bit_Count];
+            end
+        end
+    end
+
+    // Sample MISO
+    always_ff @(posedge i_Clk or negedge i_Rst_L) begin
+        if (~i_Rst_L) begin
+            o_RX_Byte      <= 8'h00;
+            o_RX_DV        <= 1'b0;
+            r_RX_Bit_Count <= 3'b111;
+        end else begin
+            o_RX_DV <= 1'b0;
+            if (o_TX_Ready)
+                r_RX_Bit_Count <= 3'b111;
+            else if ((r_Leading_Edge & ~w_CPHA) | (r_Trailing_Edge & w_CPHA)) begin
+                o_RX_Byte[r_RX_Bit_Count] <= i_SPI_MISO;
+                r_RX_Bit_Count            <= r_RX_Bit_Count - 1'b1;
+                if (r_RX_Bit_Count == 3'b000)
+                    o_RX_DV <= 1'b1;
+            end
+        end
+    end
+
+    // Output clock (delayed one cycle for alignment)
+    always_ff @(posedge i_Clk or negedge i_Rst_L) begin
+        if (~i_Rst_L)
+            o_SPI_Clk <= w_CPOL;
+        else
+            o_SPI_Clk <= r_SPI_Clk;
+    end
+
+endmodule
